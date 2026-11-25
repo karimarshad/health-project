@@ -4,8 +4,8 @@ import sqlite3
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from config import DB_PATH
@@ -15,6 +15,8 @@ st.set_page_config(
     page_icon="🏥",
     layout="wide",
 )
+
+NON_HOSPITAL_ENTITIES = {"State of Connecticut", "Unknown Provider"}
 
 
 @st.cache_data(ttl=300)
@@ -41,6 +43,7 @@ def load_rates(db_path: str) -> pd.DataFrame:
             c.category AS cpt_category,
             i.canonical_name AS insurer_name,
             COALESCE(h.hospital_name, r.provider_name, 'Unknown Provider') AS hospital_name,
+            CASE WHEN r.hospital_id IS NOT NULL THEN 1 ELSE 0 END AS is_matched_hospital,
             r.plan_name,
             r.setting,
             r.billing_class,
@@ -59,17 +62,127 @@ def load_rates(db_path: str) -> pd.DataFrame:
 
 
 def format_currency(val: float) -> str:
-    return f"${val:,.0f}" if pd.notna(val) else "—"
+    return f"${val:,.0f}" if pd.notna(val) else "Not listed"
 
 
-def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None:
-    st.markdown(
-        "Search by **CPT code** or **service name** and select your **health insurer** to compare "
-        "in-network **minimum, median, and maximum** rates across Hartford County hospitals."
+def build_price_variation_chart(chart_df: pd.DataFrame, insurer_label: str, market_median: float) -> go.Figure:
+    ordered_df = chart_df.sort_values("median_rate", ascending=True).reset_index(drop=True)
+    y_order = ordered_df["hospital_name"].tolist()[::-1]
+
+    fig = go.Figure()
+
+    # Connecting range bars
+    for _, r in ordered_df.iterrows():
+        if r["min_rate"] != r["max_rate"]:
+            fig.add_trace(
+                go.Scatter(
+                    x=[r["min_rate"], r["max_rate"]],
+                    y=[r["hospital_name"], r["hospital_name"]],
+                    mode="lines",
+                    line=dict(color="#64748b", width=6),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+
+    # Min Rate markers (label endpoints when spread is wide)
+    fig.add_trace(
+        go.Scatter(
+            x=ordered_df["min_rate"],
+            y=ordered_df["hospital_name"],
+            mode="markers+text",
+            name="Min Rate",
+            marker=dict(color="#22c55e", size=11),
+            text=[
+                f"${r['min_rate']:,.0f}" if (r["max_rate"] - r["min_rate"]) > 800 else ""
+                for _, r in ordered_df.iterrows()
+            ],
+            textposition="bottom left",
+            textfont=dict(color="#86efac", size=11),
+            hovertemplate="<b>%{y}</b><br>Min Rate: $%{x:,.0f}<extra></extra>",
+        )
     )
 
-    # Build searchable procedure options (only CPTs that exist in rates_df, or all 30)
-    avail_cpts = sorted(rates_df["cpt_code"].unique().tolist())
+    # Max Rate markers (label endpoints when spread is wide)
+    fig.add_trace(
+        go.Scatter(
+            x=ordered_df["max_rate"],
+            y=ordered_df["hospital_name"],
+            mode="markers+text",
+            name="Max Rate",
+            marker=dict(color="#ef4444", size=11),
+            text=[
+                f"${r['max_rate']:,.0f}" if (r["max_rate"] - r["median_rate"]) > 800 else ""
+                for _, r in ordered_df.iterrows()
+            ],
+            textposition="bottom right",
+            textfont=dict(color="#fca5a5", size=11),
+            hovertemplate="<b>%{y}</b><br>Max Rate: $%{x:,.0f}<extra></extra>",
+        )
+    )
+
+    # Median Rate diamonds (rendered last so they stay visible when Min == Median == Max)
+    fig.add_trace(
+        go.Scatter(
+            x=ordered_df["median_rate"],
+            y=ordered_df["hospital_name"],
+            mode="markers+text",
+            name="Median Rate",
+            marker=dict(
+                color="#3b82f6",
+                size=13,
+                symbol="diamond",
+                line=dict(color="#ffffff", width=1),
+            ),
+            text=[f"${v:,.0f}" for v in ordered_df["median_rate"]],
+            textposition="top center",
+            textfont=dict(size=12),
+            hovertemplate="<b>%{y}</b><br>Median Rate: $%{x:,.0f}<extra></extra>",
+        )
+    )
+
+    # Vertical Market Median reference line
+    fig.add_vline(
+        x=market_median,
+        line_dash="dash",
+        line_color="#f59e0b",
+        line_width=1.5,
+        annotation_text=f"Market Median: ${market_median:,.0f}",
+        annotation_position="top right",
+        annotation_font_color="#fbbf24",
+    )
+
+    fig.update_layout(
+        xaxis_title="Negotiated In-Network Rate ($)",
+        xaxis_tickprefix="$",
+        xaxis_tickformat=",.0f",
+        yaxis=dict(type="category", categoryorder="array", categoryarray=y_order),
+        height=max(320, 75 * len(ordered_df)),
+        margin=dict(l=10, r=20, t=45, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    return fig
+
+
+def render_patient_finder(
+    rates_df: pd.DataFrame,
+    cpts_df: pd.DataFrame,
+    include_non_hospitals: bool = False,
+) -> None:
+    st.caption(
+        "Compare negotiated in-network surgery rates across Hartford County hospitals to understand "
+        "price variation before scheduling your procedure."
+    )
+
+    filtered_rates = rates_df.copy()
+    if not include_non_hospitals:
+        filtered_rates = filtered_rates[
+            (filtered_rates["is_matched_hospital"] == 1)
+            & (~filtered_rates["hospital_name"].isin(NON_HOSPITAL_ENTITIES))
+        ]
+
+    # Build searchable procedure options (only CPTs that exist in filtered_rates, or all)
+    avail_cpts = sorted(filtered_rates["cpt_code"].unique().tolist())
     cpt_lookup = {
         row["cpt_code"]: f"{row['cpt_code']} — {row['description']} ({row['category']})"
         for _, row in cpts_df.iterrows()
@@ -86,13 +199,14 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
 
     with col_proc:
         selected_cpt = st.selectbox(
-            "1. Procedure (type CPT code or service name)",
+            "1. Procedure (CPT code or plain name)",
             options=list(cpt_lookup.keys()),
             format_func=lambda code: cpt_lookup.get(code, code),
             index=0,
+            help="Search by billing CPT code if you have one, or by the common procedure name.",
         )
 
-    cpt_rows = rates_df[rates_df["cpt_code"] == selected_cpt]
+    cpt_rows = filtered_rates[filtered_rates["cpt_code"] == selected_cpt]
     insurers_for_cpt = sorted(cpt_rows["insurer_name"].unique().tolist())
 
     with col_ins:
@@ -102,12 +216,13 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
             index=1 if insurers_for_cpt else 0,
         )
 
-    settings_for_cpt = sorted(cpt_rows["setting"].unique().tolist())
+    settings_for_cpt = sorted(cpt_rows["setting"].dropna().unique().tolist())
     with col_set:
         selected_setting = st.selectbox(
             "3. Care Setting",
             options=["All Settings"] + settings_for_cpt,
             index=0,
+            help="Outpatient surgery centers often have lower facility fees than main hospital campuses.",
         )
 
     # Apply filters
@@ -138,7 +253,9 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
 
     best_row = hosp_summary.iloc[0]
     worst_row = hosp_summary.iloc[-1]
-    savings_vs_max = worst_row["median_rate"] - best_row["median_rate"]
+    # True Market Median across hospitals (unweighted by plan row count)
+    market_median = float(hosp_summary["median_rate"].median())
+    savings_vs_max = float(worst_row["median_rate"] - best_row["median_rate"])
     savings_pct = (savings_vs_max / worst_row["median_rate"] * 100.0) if worst_row["median_rate"] > 0 else 0.0
 
     st.divider()
@@ -152,7 +269,7 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
             f"compared to the highest-priced hospital (**{worst_row['hospital_name']}** at {format_currency(worst_row['median_rate'])})."
         )
 
-    # --- 3 Simple KPIs ---
+    # --- 3 Clean KPIs (delta_color="off" avoids misleading up/down arrows) ---
     k1, k2, k3 = st.columns(3)
     k1.metric(
         "Lowest Hospital Median",
@@ -162,21 +279,46 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
     )
     k2.metric(
         "Typical (Market Median) Rate",
-        format_currency(slice_df["negotiated_dollar"].median()),
-        delta=f"Range: {format_currency(slice_df['negotiated_dollar'].min())} – {format_currency(slice_df['negotiated_dollar'].max())}",
+        format_currency(market_median),
+        delta=f"Full range: {format_currency(hosp_summary['min_rate'].min())} – {format_currency(hosp_summary['max_rate'].max())}",
         delta_color="off",
     )
     k3.metric(
         "Max Potential Savings",
         format_currency(savings_vs_max),
-        delta=f"{savings_pct:.1f}% lower than highest hospital",
-        delta_color="normal",
+        delta=f"{savings_pct:.1f}% lower than highest-priced hospital",
+        delta_color="off",
     )
+
+    # --- Visual Range Chart FIRST for immediate price-variation scanning ---
+    if selected_insurer != "All Insurers":
+        st.subheader(f"In-Network Price Range by Hospital — {selected_insurer}")
+        fig = build_price_variation_chart(hosp_summary, selected_insurer, market_median)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Select a specific **Health Insurer** above to view the hospital price-range chart.")
+
+    # --- Patient Decision Context ---
+    with st.expander("How to read these numbers before choosing a hospital", expanded=False):
+        ins_context = selected_insurer if selected_insurer != "All Insurers" else "your insurer"
+        st.markdown(
+            f"- **Negotiated Rate vs. Out-of-Pocket Cost:** These are the total rates negotiated between "
+            f"{ins_context} and each hospital. What you actually pay depends on your deductible, copay, and coinsurance.\n"
+            "- **Facility vs. Physician Fees:** Verify with the hospital whether the quoted rate covers only the "
+            "facility fee or also includes the surgeon and anesthesiologist.\n"
+            "- **Why `Plans` matters:** A hospital showing `1` plan (with identical Min/Median/Max) only has data "
+            "for a single plan tier—confirm your exact plan is included before booking."
+        )
 
     # --- Hospital Price Comparison Table ---
     st.subheader("Hospital Price Comparison (Sorted Lowest to Highest)")
     display_df = hosp_summary.copy()
     display_df["Savings vs. Highest"] = worst_row["median_rate"] - display_df["median_rate"]
+    display_df["vs. Market Median"] = display_df["median_rate"].apply(
+        lambda x: "At median"
+        if x == market_median
+        else (f"-${abs(x - market_median):,.0f} below" if x < market_median else f"+${x - market_median:,.0f} above")
+    )
 
     col_rename = {
         "hospital_name": "Hospital",
@@ -189,10 +331,23 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
     }
     display_df = display_df.rename(columns=col_rename)
 
+    # Format Cash Price cleanly so missing values show 'Not listed' instead of 'None'
+    display_df["Cash Price"] = display_df["Cash Price"].apply(
+        lambda x: f"${x:,.0f}" if pd.notna(x) else "Not listed"
+    )
+
     ordered_cols = ["Hospital"]
     if "Insurer" in display_df.columns:
         ordered_cols.append("Insurer")
-    ordered_cols += ["Min Rate", "Median Rate", "Max Rate", "Savings vs. Highest", "Cash Price", "Plans"]
+    ordered_cols += [
+        "Min Rate",
+        "Median Rate",
+        "Max Rate",
+        "vs. Market Median",
+        "Savings vs. Highest",
+        "Cash Price",
+        "Plans",
+    ]
     display_df = display_df[ordered_cols]
 
     st.dataframe(
@@ -202,69 +357,17 @@ def render_patient_finder(rates_df: pd.DataFrame, cpts_df: pd.DataFrame) -> None
                 "Median Rate": "${:,.0f}",
                 "Max Rate": "${:,.0f}",
                 "Savings vs. Highest": "${:,.0f}",
-                "Cash Price": lambda x: f"${x:,.0f}" if pd.notna(x) else "—",
             }
         ),
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "Plans": st.column_config.NumberColumn(
+                "Plans",
+                help="Number of insurer plan tiers with reported rates at this hospital.",
+            ),
+        },
     )
-
-    # --- Clean Range Chart (Min / Median / Max per Hospital) ---
-    if selected_insurer != "All Insurers":
-        st.subheader(f"Min, Median & Max In-Network Rates — {selected_insurer}")
-        chart_df = hosp_summary.sort_values("median_rate", ascending=True)
-
-        fig = go.Figure()
-        for _, r in chart_df.iterrows():
-            fig.add_trace(
-                go.Scatter(
-                    x=[r["min_rate"], r["max_rate"]],
-                    y=[r["hospital_name"], r["hospital_name"]],
-                    mode="lines",
-                    line=dict(color="#64748b", width=6),
-                    showlegend=False,
-                    hoverinfo="skip",
-                )
-            )
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["min_rate"],
-                y=chart_df["hospital_name"],
-                mode="markers",
-                name="Min Rate",
-                marker=dict(color="#22c55e", size=12),
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["median_rate"],
-                y=chart_df["hospital_name"],
-                mode="markers+text",
-                name="Median Rate",
-                marker=dict(color="#3b82f6", size=14, symbol="diamond"),
-                text=[f"${v:,.0f}" for v in chart_df["median_rate"]],
-                textposition="top center",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=chart_df["max_rate"],
-                y=chart_df["hospital_name"],
-                mode="markers",
-                name="Max Rate",
-                marker=dict(color="#ef4444", size=12),
-            )
-        )
-        fig.update_layout(
-            xaxis_title="Negotiated In-Network Rate ($)",
-            xaxis_tickprefix="$",
-            xaxis_tickformat=",.0f",
-            yaxis=dict(type="category", categoryorder="array", categoryarray=chart_df["hospital_name"].tolist()[::-1]),
-            height=max(300, 75 * len(chart_df)),
-            margin=dict(l=10, r=20, t=30, b=40),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
 
 def render_investor_overview(rates_df: pd.DataFrame) -> None:
@@ -349,7 +452,7 @@ def main() -> None:
         st.error(f"Database not found at `{DB_PATH}`. Run `python pipeline.py --init-only` first.")
         return
 
-    cpts_df, hospitals_df = load_reference_data(str(DB_PATH))
+    cpts_df, _ = load_reference_data(str(DB_PATH))
     rates_df = load_rates(str(DB_PATH))
 
     if rates_df.empty:
@@ -359,14 +462,24 @@ def main() -> None:
         )
         return
 
-    tab_patient, tab_investor = st.tabs(
-        ["Patient Care Cost Optimizer", "Investor & Market Overview"]
-    )
+    with st.sidebar:
+        st.header("View Options")
+        audience_view = st.radio(
+            "Dashboard Mode",
+            ["Patient Cost Optimizer", "Investor & Market Overview"],
+            index=0,
+        )
+        include_non_hospitals = False
+        if audience_view == "Patient Cost Optimizer":
+            include_non_hospitals = st.checkbox(
+                "Include non-hospital entities",
+                value=False,
+                help="Show unmatched provider rows (e.g., State of Connecticut) alongside hospitals.",
+            )
 
-    with tab_patient:
-        render_patient_finder(rates_df, cpts_df)
-
-    with tab_investor:
+    if audience_view == "Patient Cost Optimizer":
+        render_patient_finder(rates_df, cpts_df, include_non_hospitals=include_non_hospitals)
+    else:
         render_investor_overview(rates_df)
 
 
